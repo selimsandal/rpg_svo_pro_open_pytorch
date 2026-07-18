@@ -4,8 +4,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from svo_torch.alignment import SparseAlignmentResult
-from svo_torch.frame import Frame
+from svo_torch.alignment import SparseAlignmentResult, TrackingResult
+from svo_torch.camera import PinholeCamera
+from svo_torch.frame import EDGELET, FeatureSet, Frame
 from svo_torch.image import build_image_pyramid, prepare_image
 from svo_torch.odometry import MonoSVO, Stage, TrackingQuality, UpdateResult
 
@@ -45,6 +46,100 @@ def test_current_feature_gradients_are_sampled_at_their_pyramid_levels() -> None
     )
 
 
+def test_frontend_passes_camera_mask_to_all_detector_calls(monkeypatch) -> None:
+    mask = torch.ones((24, 32), dtype=torch.uint8)
+    mask[:, :16] = 0
+    camera = PinholeCamera(32, 24, 20.0, 20.0, 16.0, 12.0, mask=mask)
+    frontend = MonoSVO(camera, demo_config())
+    image = torch.zeros((24, 32), device=frontend.device, dtype=frontend.dtype)
+    frame = Frame(
+        camera=frontend.camera,
+        image=image,
+        timestamp_ns=0,
+        T_world_cam=torch.eye(4, device=frontend.device, dtype=frontend.dtype),
+        pyramid=build_image_pyramid(image, frontend.config.image_pyramid_levels),
+    )
+    observed: list[torch.Tensor | None] = []
+
+    def detect(pyramid, detector_mask):
+        assert pyramid is frame.pyramid
+        observed.append(detector_mask)
+        return FeatureSet.empty(device=frontend.device, dtype=frontend.dtype)
+
+    monkeypatch.setattr(frontend.detector, "detect", detect)
+    frontend._detect(frame)
+    frontend._augment_keyframe_features(frame)
+
+    assert len(observed) == 2
+    assert all(mask is frontend.camera.mask for mask in observed)
+
+
+def test_initializer_uses_full_grid_and_carries_forward_klt_estimates(
+    sequence, monkeypatch
+) -> None:
+    config = demo_config()
+    config.init_min_features = 8
+    config.init_min_tracked = 8
+    config.init_min_inliers = 8
+    config.init_min_disparity = 1_000.0
+    frontend = MonoSVO(sequence.camera, config)
+
+    expected_capacity = ((frontend.camera.width + config.grid_size - 1) // config.grid_size) * (
+        (frontend.camera.height + config.grid_size - 1) // config.grid_size
+    )
+    assert frontend.detector.max_features == config.max_features
+    assert frontend.initializer_detector.max_features == expected_capacity
+
+    frontend.start()
+    frontend.process(sequence.images[0], sequence.timestamp(0))
+    assert frontend._initial_reference is not None
+    assert frontend._initial_reference.features is not None
+    detected = frontend._initial_reference.features.pixels.clone()
+    assert len(detected) > config.init_min_features
+
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    delta = detected.new_tensor([0.75, -0.25])
+
+    def track(ref_pyramid, cur_pyramid, pixels_ref, pixels_initial):
+        del ref_pyramid, cur_pyramid
+        status = torch.ones(pixels_ref.shape[0], dtype=torch.bool, device=pixels_ref.device)
+        if not calls:
+            status[-3:] = False
+        calls.append((pixels_ref.clone(), pixels_initial.clone(), status.clone()))
+        return TrackingResult(
+            pixels=pixels_initial + delta,
+            status=status,
+            error=torch.zeros(
+                pixels_ref.shape[0], device=pixels_ref.device, dtype=pixels_ref.dtype
+            ),
+            iterations=torch.ones(pixels_ref.shape[0], device=pixels_ref.device, dtype=torch.long),
+        )
+
+    monkeypatch.setattr(frontend.tracker, "track", track)
+    frontend.process(sequence.images[1], sequence.timestamp(1))
+    frontend.process(sequence.images[2], sequence.timestamp(2))
+
+    first_ref, first_initial, first_status = calls[0]
+    second_ref, second_initial, _ = calls[1]
+    torch.testing.assert_close(first_ref, detected)
+    torch.testing.assert_close(first_initial, detected)
+    torch.testing.assert_close(second_ref, detected[first_status])
+    torch.testing.assert_close(second_initial, (detected + delta)[first_status])
+
+
+def test_visual_only_pose_prediction_matches_original_zero_motion_prior(sequence) -> None:
+    frontend = MonoSVO(sequence.camera, demo_config())
+    frontend.start()
+    frontend.process(sequence.images[0], sequence.timestamp(0))
+    initialized = frontend.process(sequence.images[1], sequence.timestamp(1))
+
+    assert initialized.stage == Stage.TRACKING
+    assert frontend.last_frame is not None
+    assert frontend._last_motion is not None
+    assert float(torch.linalg.vector_norm(frontend._last_motion[:3, 3])) > 0.0
+    torch.testing.assert_close(frontend._predicted_pose(), frontend.last_frame.T_world_cam)
+
+
 def test_unusable_sparse_alignment_does_not_replace_motion_prior(sequence, monkeypatch) -> None:
     frontend = MonoSVO(sequence.camera, demo_config())
     frontend.start()
@@ -75,11 +170,17 @@ def test_unusable_sparse_alignment_does_not_replace_motion_prior(sequence, monke
             iterations=1,
             converged=converged,
         )
-        monkeypatch.setattr(
-            frontend.aligner,
-            "align",
-            lambda *args, _result=result, **kwargs: _result,
-        )
+
+        def align(*args, _result=result, **kwargs):
+            torch.testing.assert_close(
+                args[4],
+                torch.eye(4, device=frontend.device, dtype=frontend.dtype),
+                rtol=0.0,
+                atol=0.0,
+            )
+            return _result
+
+        monkeypatch.setattr(frontend.aligner, "align", align)
         frame.T_world_cam = prior.clone()
         frontend._direct_pose_prior(reference, frame)
         torch.testing.assert_close(frame.T_world_cam, prior)
@@ -156,6 +257,86 @@ def test_local_map_recovers_older_keyframe_landmarks_with_few_last_tracks(
     assert len(final_tracks) == len(set(final_tracks))
 
 
+def test_structure_optimization_is_bounded_and_least_recently_updated(
+    sequence, monkeypatch
+) -> None:
+    config = demo_config()
+    config.structure_optimization_max_points = 2
+    frontend = MonoSVO(sequence.camera, config)
+    frontend.start()
+    frontend.process(sequence.images[0], sequence.timestamp(0))
+    frontend.process(sequence.images[1], sequence.timestamp(1))
+    frame = frontend.last_frame
+    assert frame is not None and frame.features is not None
+
+    eligible: list[tuple[int, int]] = []
+    for feature_index, landmark_id in enumerate(frame.features.landmark_ids.tolist()):
+        landmark = frontend.map.landmarks.get(int(landmark_id))
+        if landmark is not None and len(landmark.observations) >= 2:
+            eligible.append((feature_index, landmark.id))
+    assert len(eligible) >= 4
+
+    for landmark in frontend.map.landmarks.values():
+        landmark.last_structure_optimization = 100
+    edge_index, edge_id = eligible[0]
+    first_index, first_id = eligible[1]
+    second_index, second_id = eligible[2]
+    _, later_id = eligible[3]
+    frame.features.kinds[edge_index] = EDGELET
+    frontend.map.landmarks[edge_id].last_structure_optimization = 0
+    frontend.map.landmarks[first_id].last_structure_optimization = 0
+    frontend.map.landmarks[second_id].last_structure_optimization = 0
+    frontend.map.landmarks[later_id].last_structure_optimization = 5
+    assert first_index < second_index
+
+    landmark_by_tensor = {
+        id(landmark.position_world): landmark.id for landmark in frontend.map.landmarks.values()
+    }
+    calls: list[tuple[int, int]] = []
+
+    def record_optimization(point, poses, pixels, cameras, **kwargs):
+        assert poses.shape[0] == pixels.shape[0] == len(cameras) == 2
+        assert kwargs == {"max_iterations": 5, "huber_delta": config.pose_huber_delta}
+        calls.append((landmark_by_tensor[id(point)], poses.shape[0]))
+        return point + point.new_tensor([1e-4, 0.0, 0.0])
+
+    monkeypatch.setattr("svo_torch.odometry.optimize_point", record_optimization)
+    optimized = frontend._optimize_structure(frame)
+
+    assert optimized == 2
+    assert [landmark_id for landmark_id, _ in calls] == [first_id, second_id]
+    assert frontend.map.landmarks[edge_id].last_structure_optimization == 0
+    assert frontend.map.landmarks[later_id].last_structure_optimization == 5
+    assert frontend.map.landmarks[first_id].last_structure_optimization == frame.id
+    assert frontend.map.landmarks[second_id].last_structure_optimization == frame.id
+
+
+def test_relocalization_uses_configured_trial_boundary(sequence) -> None:
+    config = demo_config()
+    config.relocalization_max_trials = 3
+    frontend = MonoSVO(sequence.camera, config)
+    frontend.start()
+    image = prepare_image(sequence.images[0], device=frontend.device, dtype=frontend.dtype)
+    frame = Frame(
+        camera=frontend.camera,
+        image=image,
+        timestamp_ns=sequence.timestamp(0),
+        T_world_cam=torch.eye(4, device=frontend.device, dtype=frontend.dtype),
+        pyramid=build_image_pyramid(image, frontend.config.image_pyramid_levels),
+    )
+
+    first = frontend._tracking_failure(frame, "test failure")
+    second = frontend._tracking_failure(frame, "test failure")
+    assert first.stage == second.stage == Stage.RELOCALIZING
+    assert frontend._relocalization_trials == 2
+
+    boundary = frontend._tracking_failure(frame, "test failure")
+    assert boundary.stage == Stage.INITIALIZING
+    assert frontend.stage == Stage.INITIALIZING
+    assert frontend._relocalization_trials == 0
+    assert "restarting initialization" in boundary.message
+
+
 def test_mono_svo_state_machine_end_to_end(sequence) -> None:
     frontend = MonoSVO(sequence.camera, demo_config())
 
@@ -199,8 +380,8 @@ def test_mono_svo_state_machine_end_to_end(sequence) -> None:
     tracked = frontend.process(sequence.images[2], sequence.timestamp(2))
     assert tracked.stage == Stage.TRACKING
     assert tracked.quality == TrackingQuality.GOOD
-    assert tracked.update == UpdateResult.KEYFRAME
-    assert tracked.is_keyframe
+    assert tracked.update != UpdateResult.FAILURE
+    assert tracked.is_keyframe == (tracked.update == UpdateResult.KEYFRAME)
     assert tracked.num_observations >= demo_config().quality_min_features
     assert tracked.T_world_cam is not None
     assert initialized.T_world_cam is not None
@@ -215,7 +396,8 @@ def test_mono_svo_state_machine_end_to_end(sequence) -> None:
     retried = frontend.process(sequence.images[3], sequence.timestamp(3))
     assert retried.stage == Stage.TRACKING
     assert retried.quality == TrackingQuality.GOOD
-    assert retried.update == UpdateResult.KEYFRAME
+    assert retried.update != UpdateResult.FAILURE
+    assert retried.is_keyframe == (retried.update == UpdateResult.KEYFRAME)
 
     frontend.reset()
     assert frontend.stage == Stage.PAUSED

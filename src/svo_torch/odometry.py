@@ -15,12 +15,13 @@ from torch import Tensor
 from .alignment import PyramidalPatchTracker, SparseImageAligner
 from .camera import Camera
 from .config import SVOConfig
+from .depth_filter import SynchronousDepthFilter
 from .features import GridFeatureDetector
-from .frame import INVALID_ID, FeatureSet, Frame, SparseMap
+from .frame import EDGELET, INVALID_ID, FeatureSet, Frame, Landmark, SparseMap
 from .geometry import invert_transform, transform_points
 from .image import build_image_pyramid, image_gradients, prepare_image, sample_image
 from .initialization import estimate_two_view_geometry
-from .optimization import PoseOptimizer
+from .optimization import PoseOptimizer, optimize_point
 
 
 class Stage(StrEnum):
@@ -72,6 +73,22 @@ class MonoSVO:
             edgelet_ratio=self.config.detector_edgelet_ratio,
             max_level=min(self.config.n_pyr_levels - 1, 2),
         )
+        # SVO Pro's bootstrap tracker asks the detector for the complete
+        # occupancy grid, independently of the ``max_fts`` map budget.  At
+        # 752x480 with 30-pixel cells this permits 416 initial tracks, which
+        # gives the five/eight-point estimator substantially more support than
+        # the normal 180-feature tracking budget.
+        initializer_capacity = (
+            (self.camera.width + self.config.grid_size - 1) // self.config.grid_size
+        ) * ((self.camera.height + self.config.grid_size - 1) // self.config.grid_size)
+        self.initializer_detector = GridFeatureDetector(
+            max_features=initializer_capacity,
+            grid_size=self.config.grid_size,
+            quality_level=self.config.detector_threshold,
+            border=self.config.feature_border,
+            edgelet_ratio=self.config.detector_edgelet_ratio,
+            max_level=min(self.config.n_pyr_levels - 1, 2),
+        )
         self.tracker = PyramidalPatchTracker(
             patch_size=self.config.patch_size,
             max_level=self.config.alignment_max_level,
@@ -92,6 +109,12 @@ class MonoSVO:
             huber_delta=self.config.pose_huber_delta,
             outlier_threshold=self.config.pose_reprojection_threshold,
         )
+        self.depth_filter = SynchronousDepthFilter(
+            self.camera,
+            convergence_threshold=self.config.seed_convergence_sigma2_thresh,
+            max_updates=self.config.seed_max_updates,
+            reprojection_threshold=self.config.pose_reprojection_threshold,
+        )
         self.map = SparseMap(self.config.max_keyframes)
         self.stage = Stage.PAUSED
         self.quality = TrackingQuality.INSUFFICIENT
@@ -99,6 +122,7 @@ class MonoSVO:
         self.previous_frame: Frame | None = None
         self.last_keyframe: Frame | None = None
         self._initial_reference: Frame | None = None
+        self._initial_tracked_pixels: Tensor | None = None
         self._last_timestamp_ns: int | None = None
         self._last_motion: Tensor | None = None
         self._next_track_id = 0
@@ -155,11 +179,13 @@ class MonoSVO:
 
     def _clear_runtime(self) -> None:
         self.map.clear()
+        self.depth_filter.clear()
         self.quality = TrackingQuality.INSUFFICIENT
         self.last_frame = None
         self.previous_frame = None
         self.last_keyframe = None
         self._initial_reference = None
+        self._initial_tracked_pixels = None
         self._last_timestamp_ns = None
         self._last_motion = None
         self._next_track_id = 0
@@ -176,12 +202,24 @@ class MonoSVO:
     def _predicted_pose(self) -> Tensor:
         if self.last_frame is None:
             return torch.eye(4, device=self.device, dtype=self.dtype)
-        if self._last_motion is None:
-            return self.last_frame.T_world_cam.clone()
-        return self.last_frame.T_world_cam @ invert_transform(self._last_motion)
+        # Match SVO Pro's visual-only path: without an IMU or an explicitly
+        # weighted pose/image-alignment prior, the new frame starts at the
+        # previous frame pose. Sparse image alignment supplies the inter-frame
+        # motion estimate. Unconditionally extrapolating the last full SE(3)
+        # update is materially different from the C++ frontend and amplifies
+        # monocular depth/translation uncertainty into a poor patch-search
+        # initialization.
+        return self.last_frame.T_world_cam.clone()
 
-    def _detect(self, frame: Frame) -> FeatureSet:
-        features = self.detector.detect(frame.pyramid)
+    def _detect(
+        self,
+        frame: Frame,
+        *,
+        detector: GridFeatureDetector | None = None,
+    ) -> FeatureSet:
+        features = (self.detector if detector is None else detector).detect(
+            frame.pyramid, self.camera.mask
+        )
         count = len(features)
         features.track_ids = torch.arange(
             self._next_track_id,
@@ -264,8 +302,9 @@ class MonoSVO:
         )
 
     def _accept_initial_reference(self, frame: Frame) -> OdometryResult:
-        features = self._detect(frame)
+        features = self._detect(frame, detector=self.initializer_detector)
         self._initial_reference = frame
+        self._initial_tracked_pixels = features.pixels.detach().clone()
         if len(features) < self.config.init_min_features:
             return self._result(
                 frame.timestamp_ns,
@@ -285,16 +324,28 @@ class MonoSVO:
         if reference is None:
             return self._accept_initial_reference(frame)
         assert reference.features is not None
+        assert self._initial_tracked_pixels is not None
         tracked = self.tracker.track(
             reference.pyramid,
             frame.pyramid,
             reference.features.pixels,
+            self._initial_tracked_pixels,
         )
         count = int(tracked.status.sum())
-        if count < self.config.init_min_tracked:
+        # This intentionally follows the released C++ implementation, which
+        # resets against init_min_features here (despite also parsing the
+        # older init_min_tracked option).
+        if count < self.config.init_min_features:
             return self._accept_initial_reference(frame)
         ref_tracked = reference.features[tracked.status]
-        pixels_cur = tracked.pixels[tracked.status]
+        pixels_cur = tracked.pixels[tracked.status].detach()
+        # Keep the first observation as the photometric template, but carry
+        # the previous-frame estimate into the next KLT call and discard
+        # terminated tracks.  This is FeatureTracker's default behavior in
+        # rpg_svo_pro_open and is important once displacement grows beyond a
+        # single coarse-level convergence basin.
+        reference.features = ref_tracked
+        self._initial_tracked_pixels = pixels_cur
         disparity = torch.linalg.vector_norm(pixels_cur - ref_tracked.pixels, dim=-1).median()
         if float(disparity) < self.config.init_min_disparity:
             return self._result(
@@ -348,6 +399,7 @@ class MonoSVO:
 
         self.map.add_keyframe(reference)
         self._augment_keyframe_features(frame)
+        self._initialize_keyframe_seeds(frame)
         self._record_keyframe_observations(frame)
         self.map.add_keyframe(frame)
         self.previous_frame = reference
@@ -357,6 +409,7 @@ class MonoSVO:
         self._frames_since_keyframe = 0
         self._last_observation_count = int(geometry.inliers.sum())
         self._initial_reference = None
+        self._initial_tracked_pixels = None
         self.stage = Stage.TRACKING
         self.quality = TrackingQuality.GOOD
         return self._result(
@@ -371,17 +424,32 @@ class MonoSVO:
     def _landmark_points(self, features: FeatureSet) -> tuple[Tensor, Tensor]:
         indices: list[int] = []
         points: list[Tensor] = []
-        for index, landmark_id in enumerate(features.landmark_ids.detach().cpu().tolist()):
+        landmark_ids = features.landmark_ids.detach().cpu().tolist()
+        track_ids = features.track_ids.detach().cpu().tolist()
+        for index, (landmark_id, track_id) in enumerate(zip(landmark_ids, track_ids, strict=True)):
             landmark = self.map.landmarks.get(int(landmark_id))
             if landmark is not None:
                 indices.append(index)
                 points.append(landmark.position_world.to(device=self.device, dtype=self.dtype))
+                continue
+            seed_point = self.depth_filter.point_for_track(int(track_id))
+            if seed_point is not None:
+                indices.append(index)
+                points.append(seed_point.to(device=self.device, dtype=self.dtype))
         if not indices:
             return (
                 torch.empty(0, device=self.device, dtype=torch.long),
                 torch.empty((0, 3), device=self.device, dtype=self.dtype),
             )
         return torch.tensor(indices, device=self.device), torch.stack(points)
+
+    def _num_tracked_landmarks(self, features: FeatureSet) -> int:
+        """Count map-backed tracks, excluding inverse-depth seed references."""
+
+        return sum(
+            int(landmark_id) in self.map.landmarks
+            for landmark_id in features.landmark_ids.detach().cpu().tolist()
+        )
 
     def _direct_pose_prior(self, reference: Frame, frame: Frame) -> None:
         if not self.config.use_sparse_image_alignment or reference.features is None:
@@ -391,7 +459,11 @@ class MonoSVO:
             return
         points_ref = reference.camera_from_world(points_world)
         depths = torch.linalg.vector_norm(points_ref, dim=-1)
-        T_cur_ref = invert_transform(frame.T_world_cam) @ reference.T_world_cam
+        # The supported visual-only path has no external motion prior, so the
+        # original frontend initializes sparse alignment with the identity
+        # relative pose. Construct it exactly: forming R.T @ R from float32
+        # pose matrices would amplify harmless SO(3) round-off every frame.
+        T_cur_ref = torch.eye(4, device=self.device, dtype=self.dtype)
         aligned = self.aligner.align(
             reference.pyramid,
             frame.pyramid,
@@ -649,6 +721,9 @@ class MonoSVO:
         keep = torch.ones(len(frame.features), dtype=torch.bool, device=self.device)
         keep[landmark_indices[~optimized.inliers]] = False
         frame.features = frame.features[keep]
+        tracked_landmarks = self._num_tracked_landmarks(frame.features)
+        seed_updates = self.depth_filter.update_observed(frame)
+        self._optimize_structure(frame)
         feature_drop = self._last_observation_count - inlier_count
         self.quality = (
             TrackingQuality.BAD
@@ -662,11 +737,16 @@ class MonoSVO:
 
         update = UpdateResult.DEFAULT
         is_keyframe = False
-        if self._needs_keyframe(frame, inlier_count):
+        promoted_seeds = 0
+        initialized_seeds = 0
+        if self._needs_keyframe(frame, tracked_landmarks):
+            promoted_seeds = self.depth_filter.promote_observed(frame, self.map)
             self._promote_new_landmarks(frame)
             self._augment_keyframe_features(frame)
+            initialized_seeds = self._initialize_keyframe_seeds(frame)
             self._record_keyframe_observations(frame)
             self.map.add_keyframe(frame)
+            self.depth_filter.discard_missing_keyframes(set(self.map.keyframes))
             self.last_keyframe = frame
             self._frames_since_keyframe = 0
             update = UpdateResult.KEYFRAME
@@ -680,6 +760,13 @@ class MonoSVO:
         message = "relocalized" if was_relocalizing else "tracking"
         if len(recovered):
             message = f"{message}; recovered {len(recovered)} map landmarks"
+        if seed_updates:
+            message = f"{message}; updated {seed_updates} depth seeds"
+        if promoted_seeds or initialized_seeds:
+            message = (
+                f"{message}; promoted {promoted_seeds} and initialized "
+                f"{initialized_seeds} depth seeds"
+            )
         return self._result(
             frame.timestamp_ns,
             update,
@@ -706,12 +793,98 @@ class MonoSVO:
             message,
             observations=observations,
         )
-        if self._relocalization_trials >= 10:
+        if self._relocalization_trials >= self.config.relocalization_max_trials:
             self._restart_initialization()
             result.stage = self.stage
             result.sparse_points = self.map.points_tensor(dtype=self.dtype, device=self.device)
             result.message = f"{message}; restarting initialization"
         return result
+
+    def _structure_observations(
+        self,
+        landmark: Landmark,
+    ) -> tuple[list[Tensor], list[Tensor], list[Camera]] | None:
+        """Collect retained keyframe measurements for one map landmark."""
+
+        poses: list[Tensor] = []
+        pixels: list[Tensor] = []
+        cameras: list[Camera] = []
+        for frame_id, feature_index in landmark.observations.items():
+            keyframe = self.map.keyframes.get(frame_id)
+            if (
+                keyframe is None
+                or keyframe.features is None
+                or not 0 <= feature_index < len(keyframe.features)
+            ):
+                continue
+            poses.append(keyframe.T_world_cam)
+            pixels.append(keyframe.features.pixels[feature_index])
+            cameras.append(keyframe.camera)
+        if len(poses) < 2:
+            return None
+        return poses, pixels, cameras
+
+    def _optimize_structure(self, frame: Frame) -> int:
+        """Refine a bounded, least-recently-optimized set of corner landmarks.
+
+        This mirrors ``FrameHandlerBase::optimizeStructure``: points must be
+        visible as corner observations in the current frame, but their stored
+        keyframe observations define the structure objective. The explicit
+        feature-order tie break makes the C++ ``nth_element`` policy
+        deterministic when several points have the same last-update frame.
+        """
+
+        limit = self.config.structure_optimization_max_points
+        if limit == 0 or frame.features is None:
+            return 0
+
+        candidates: list[tuple[int, int, Landmark, list[Tensor], list[Tensor], list[Camera]]] = []
+        seen: set[int] = set()
+        for feature_index, (kind, landmark_id) in enumerate(
+            zip(
+                frame.features.kinds.detach().cpu().tolist(),
+                frame.features.landmark_ids.detach().cpu().tolist(),
+                strict=True,
+            )
+        ):
+            landmark = self.map.landmarks.get(int(landmark_id))
+            if int(kind) == EDGELET or landmark is None or landmark.id in seen:
+                continue
+            observations = self._structure_observations(landmark)
+            if observations is None:
+                continue
+            poses, pixels, cameras = observations
+            candidates.append(
+                (
+                    landmark.last_structure_optimization,
+                    feature_index,
+                    landmark,
+                    poses,
+                    pixels,
+                    cameras,
+                )
+            )
+            seen.add(landmark.id)
+
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+        if limit > 0:
+            candidates = candidates[:limit]
+
+        optimized = 0
+        for _, _, landmark, poses, pixels, cameras in candidates:
+            refined = optimize_point(
+                landmark.position_world,
+                torch.stack(poses),
+                torch.stack(pixels),
+                cameras,
+                max_iterations=5,
+                huber_delta=self.config.pose_huber_delta,
+            )
+            if bool(torch.isfinite(refined).all()):
+                landmark.position_world = refined.detach()
+            landmark.last_structure_optimization = frame.id
+            optimized += 1
+        return optimized
 
     def _common_track_disparity(self, first: Frame, second: Frame) -> float:
         assert first.features is not None and second.features is not None
@@ -734,12 +907,52 @@ class MonoSVO:
     def _needs_keyframe(self, frame: Frame, observations: int) -> bool:
         if self.last_keyframe is None:
             return True
+        if self.config.keyframe_criterion == "DOWNLOOKING":
+            # SVO Pro normalizes this test by scene depth. Landmark depth is
+            # directly available here, so use its median just as the C++
+            # frontend's frame_utils::getSceneDepth does.
+            indices, points_world = self._landmark_points(frame.features)
+            if indices.numel():
+                depths = torch.linalg.vector_norm(frame.camera_from_world(points_world), dim=-1)
+                finite_depths = depths[torch.isfinite(depths) & (depths > 0)]
+                median_depth = float(finite_depths.median()) if finite_depths.numel() else 1.0
+            else:
+                median_depth = 1.0
+            for keyframe in self.map.keyframes.values():
+                relative = frame.camera_from_world(keyframe.position)
+                limit = self.config.keyframe_min_distance * median_depth
+                if (
+                    abs(float(relative[0])) < limit
+                    and abs(float(relative[1])) < limit * 0.8
+                    and abs(float(relative[2])) < limit * 1.3
+                ):
+                    return False
+            return True
+
+        # SVO Pro's FORWARD selector intentionally checks feature-count bounds
+        # before disparity and pose overlap. Critically low tracking therefore
+        # forces a keyframe while there are still enough landmarks to recover.
+        if observations > self.config.keyframe_num_features_upper:
+            return False
         if self._frames_since_keyframe < self.config.keyframe_min_frames:
             return False
-        previous_observations = max(1, self._last_observation_count)
-        low_tracks = observations < previous_observations * self.config.keyframe_min_tracked_ratio
+        if observations < self.config.keyframe_num_features_lower:
+            return True
         disparity = self._common_track_disparity(self.last_keyframe, frame)
-        return low_tracks or disparity >= self.config.keyframe_min_disparity
+        if disparity < self.config.keyframe_min_disparity:
+            return False
+
+        for keyframe in self.map.keyframes.values():
+            rotation = frame.T_world_cam[:3, :3].transpose(-1, -2) @ keyframe.T_world_cam[:3, :3]
+            cosine = ((torch.trace(rotation) - 1.0) * 0.5).clamp(-1.0, 1.0)
+            angle = float(torch.rad2deg(torch.acos(cosine)))
+            distance = float(torch.linalg.vector_norm(frame.position - keyframe.position))
+            if (
+                angle < self.config.keyframe_min_angle_degrees
+                and distance < self.config.keyframe_min_distance_metric
+            ):
+                return False
+        return True
 
     @staticmethod
     def _triangulate_rays(
@@ -812,12 +1025,27 @@ class MonoSVO:
             reference.features.landmark_ids[ref_index] = landmark.id
             frame.features.landmark_ids[cur_index] = landmark.id
 
+    def _initialize_keyframe_seeds(self, frame: Frame) -> int:
+        """Add inverse-depth priors after existing observations occupy the frame."""
+
+        assert frame.features is not None
+        _, points_world = self._landmark_points(frame.features)
+        if points_world.numel():
+            scene_depths = torch.linalg.vector_norm(frame.camera_from_world(points_world), dim=-1)
+        else:
+            scene_depths = torch.empty(0, device=self.device, dtype=self.dtype)
+        return self.depth_filter.add_keyframe(
+            frame,
+            scene_depths,
+            fallback_depth=self.config.init_map_scale,
+        )
+
     def _augment_keyframe_features(self, frame: Frame) -> None:
         assert frame.features is not None
         capacity = self.config.max_features - len(frame.features)
         if capacity <= 0:
             return
-        detected = self.detector.detect(frame.pyramid)
+        detected = self.detector.detect(frame.pyramid, self.camera.mask)
         if not len(detected):
             return
         if len(frame.features):

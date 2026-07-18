@@ -19,6 +19,44 @@ uv sync --dev
 uv run pytest
 ```
 
+## Official RPG real-data Quickstart
+
+From the repository root, the following Bash commands download the official
+Airground pinhole bag, extract the default bounded 500-frame slice, run PyTorch
+on CUDA when available (otherwise CPU), and Sim(3)-align the monocular result
+to the bag ground truth. Integrity verification requires downloading the full
+1.77 GB bag even though only 500 images are decoded by default:
+
+```bash
+uv sync --dev --extra examples
+DEVICE="$(uv run python -c 'import torch; print("cuda" if torch.cuda.is_available() else "cpu")')"
+
+uv run --extra examples python examples/rpg_svo_pro_open/prepare_bag.py pinhole --download
+uv run svo-torch run real-data/pinhole \
+  --calibration real-data/pinhole/calib.yaml \
+  --config examples/rpg_svo_pro_open/config/pinhole.yaml \
+  --format benchmark \
+  --device "$DEVICE" \
+  --trajectory real-data/pinhole/trajectory-pytorch.txt
+uv run python examples/rpg_svo_pro_open/evaluate_trajectory.py \
+  real-data/pinhole/data/stamped_groundtruth.txt \
+  pytorch=real-data/pinhole/trajectory-pytorch.txt \
+  --images real-data/pinhole/data/images.txt \
+  --json real-data/pinhole/evaluation-pytorch.json
+```
+
+The trajectory is written to `real-data/pinhole/trajectory-pytorch.txt`; the
+machine-readable metrics are in `real-data/pinhole/evaluation-pytorch.json`.
+For this bag, use coverage and Sim(3)-aligned position ATE as the implementation
+parity metrics. The `Rig` ground-truth quaternion basis/convention is not
+directly camera-comparable: in our native 400-frame verification, position ATE
+was 4.50 mm while absolute rotation RMSE was 178.49°. The evaluator still
+prints rotation values for diagnostics, but they are not a meaningful
+C++/PyTorch parity test.
+See the [official-data example guide](examples/rpg_svo_pro_open/README.md) for
+bag provenance and SHA-256 values, an existing-bag path, complete extraction,
+C++/PyTorch comparison, and the optional masked Omni/fisheye example.
+
 Inspect an original SVO calibration:
 
 ```bash
@@ -51,6 +89,9 @@ Calibration files use the canonical SVO
 `cameras: [{camera: ..., T_B_C: ...}]` YAML schema. Pinhole cameras support no
 distortion, radial-tangential, equidistant, and one-parameter ATAN/fisheye
 distortion. The original 24-parameter omnidirectional model is supported too.
+Embedded Omni annular masks and external bitmap masks are honored during
+feature detection; bitmap paths are resolved relative to their calibration
+YAML.
 
 ## Python API
 
@@ -82,7 +123,7 @@ nanoseconds and must be strictly increasing.
 
 | SVO Pro subsystem | PyTorch implementation |
 | --- | --- |
-| `vikit_cameras` | Differentiable pinhole/omni projection and SVO YAML rig loading |
+| `vikit_cameras` | Differentiable pinhole/omni projection and SVO YAML rig/mask loading |
 | `svo_common` | Frames, parallel feature tensors, landmarks, bounded keyframe map |
 | `svo_direct` | Shi–Tomasi/edgelet detection, patch sampling, epipolar matching, inverse-depth Bayesian updates |
 | `svo_tracker` | Batched inverse-compositional pyramidal patch tracking |

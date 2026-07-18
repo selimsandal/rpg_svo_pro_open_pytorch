@@ -1,5 +1,6 @@
 import torch
 
+import svo_torch.initialization as initialization
 from svo_torch.camera import PinholeCamera
 from svo_torch.geometry import se3_exp, skew, so3_exp, transform_points
 from svo_torch.initialization import _sampson_error, estimate_two_view_geometry
@@ -88,3 +89,48 @@ def test_angular_epipolar_error_is_coordinate_rotation_invariant() -> None:
         bearings_cur @ common_rotation.T,
     )
     torch.testing.assert_close(rotated_errors, errors, atol=1e-14, rtol=1e-8)
+
+
+def test_ransac_retains_a_minimal_model_when_consensus_refit_degrades(monkeypatch) -> None:
+    """A bad non-minimal refit must neither replace nor stop a good model."""
+
+    dtype = torch.float64
+    camera = PinholeCamera(640, 480, 450.0, 452.0, 320.0, 240.0, dtype=dtype)
+    generator = torch.Generator().manual_seed(31)
+    points_ref = torch.rand((80, 3), generator=generator, dtype=dtype)
+    points_ref[:, :2] = (points_ref[:, :2] - 0.5) * 2.0
+    points_ref[:, 2] = points_ref[:, 2] * 2.0 + 4.0
+    truth = se3_exp(torch.tensor([0.4, -0.02, 0.03, 0.01, -0.02, 0.005], dtype=dtype))
+    pixels_ref, valid_ref = camera.project(points_ref)
+    pixels_cur, valid_cur = camera.project(transform_points(truth, points_ref))
+    valid = valid_ref & valid_cur
+
+    good_essential = skew(truth[:3, 3]) @ truth[:3, :3]
+    bad_essential = skew(torch.tensor([-0.1, 0.7, 0.2], dtype=dtype)) @ so3_exp(
+        torch.tensor([0.4, -0.3, 0.2], dtype=dtype)
+    )
+    calls = {"minimal": 0, "refit": 0}
+
+    def controlled_estimator(bearings_ref, bearings_cur):
+        del bearings_cur
+        if bearings_ref.shape[0] == 8:
+            calls["minimal"] += 1
+            return good_essential
+        calls["refit"] += 1
+        return bad_essential
+
+    monkeypatch.setattr(initialization, "_essential_from_bearings", controlled_estimator)
+    result = estimate_two_view_geometry(
+        camera,
+        pixels_ref[valid],
+        pixels_cur[valid],
+        pixel_threshold=1.0,
+        min_inliers=40,
+        max_iterations=4,
+        random_seed=7,
+    )
+
+    assert result is not None
+    assert int(result.inliers.sum()) == int(valid.sum())
+    assert result.iterations == 4
+    assert calls == {"minimal": 4, "refit": 2}

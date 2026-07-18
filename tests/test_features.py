@@ -49,11 +49,16 @@ def test_grid_detector_returns_distributed_corners_and_edgelets() -> None:
     assert torch.unique(cell_ids).numel() == len(features)
 
 
-def test_detector_honors_level_zero_mask() -> None:
+def test_detector_honors_level_zero_mask(monkeypatch) -> None:
     pyramid = build_image_pyramid(_corner_scene(), 2)
     mask = torch.zeros((96, 96), dtype=torch.uint8)
     mask[:, :48] = 255
     detector = GridFeatureDetector(30, 10, 0.01, 5, 0.4, max_level=1)
+
+    def unexpected_grid_sample(*args, **kwargs):
+        raise AssertionError("mask lookup must not expand the image through grid_sample")
+
+    monkeypatch.setattr(torch.nn.functional, "grid_sample", unexpected_grid_sample)
     features = detector.detect(pyramid, mask)
     assert len(features) > 0
     assert (features.pixels[:, 0] < 48).all()

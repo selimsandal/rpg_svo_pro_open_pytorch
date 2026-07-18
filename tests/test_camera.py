@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from PIL import Image
 
 from svo_torch.camera import CameraRig, OmniCamera, PinholeCamera, load_camera_rig
 
@@ -108,6 +109,42 @@ def test_pinhole_project_is_differentiable_and_to_scale_preserve_calibration() -
     assert single.distortion == "radial-tangential"
 
 
+def test_pinhole_mask_uses_cpp_indexing_and_does_not_change_projection_validity() -> None:
+    mask = torch.zeros((3, 4), dtype=torch.uint8)
+    mask[1, 2] = 17
+    camera = PinholeCamera(4, 3, 1.0, 1.0, 0.0, 0.0, mask=mask, dtype=DTYPE)
+
+    pixels = torch.tensor(
+        [[2.9, 1.9], [1.9, 1.9], [-0.1, 1.0], [4.0, 1.0]],
+        dtype=DTYPE,
+    )
+    assert camera.is_masked(pixels).tolist() == [False, True, True, True]
+    assert camera.mask is not None
+    assert camera.mask.dtype == torch.uint8
+    assert camera.mask[1, 2].item() == 1
+
+    # Camera masks constrain feature detection in SVO, not geometric projection.
+    masked_bearing = camera.unproject(torch.tensor([1.0, 1.0], dtype=DTYPE))
+    _, valid = camera.project(masked_bearing)
+    assert bool(valid)
+
+
+def test_camera_mask_is_preserved_by_to_and_scale() -> None:
+    mask = torch.zeros((4, 4), dtype=torch.uint8)
+    mask[:, 2:] = 255
+    camera = PinholeCamera(4, 4, 2.0, 2.0, 2.0, 2.0, mask=mask, dtype=DTYPE)
+
+    converted = camera.to(dtype=torch.float32)
+    assert converted.mask is not None
+    assert converted.mask.dtype == torch.uint8
+    torch.testing.assert_close(converted.mask, camera.mask)
+
+    scaled = camera.scale(0.5)
+    assert scaled.mask is not None
+    assert scaled.mask.shape == (2, 2)
+    torch.testing.assert_close(scaled.mask, torch.tensor([[0, 1], [0, 1]], dtype=torch.uint8))
+
+
 def test_omni_24_parameter_projection_round_trip_mask_and_scale() -> None:
     camera = OmniCamera(752, 480, OMNI_PARAMETERS, dtype=DTYPE)
     pixels = torch.tensor(
@@ -130,7 +167,79 @@ def test_omni_24_parameter_projection_round_trip_mask_and_scale() -> None:
     masked_parameters[-2:] = [0.2, 0.4]
     masked = OmniCamera(752, 480, masked_parameters, dtype=DTYPE)
     _, center_valid = masked.project(masked.unproject(torch.tensor([320.0, 240.0], dtype=DTYPE)))
-    assert not bool(center_valid)
+    assert bool(center_valid)
+    assert masked.mask is not None
+    assert bool(masked.is_masked(torch.tensor([320.0, 240.0], dtype=DTYPE)))
+
+
+def test_load_camera_mask_relative_to_calibration_and_override_omni_annulus(
+    tmp_path: Path,
+) -> None:
+    calibration_directory = tmp_path / "calibration"
+    mask_directory = calibration_directory / "masks"
+    mask_directory.mkdir(parents=True)
+    mask_path = mask_directory / "override.png"
+    bitmap = Image.new("L", (8, 6), 0)
+    bitmap.putpixel((3, 2), 255)
+    bitmap.save(mask_path)
+
+    parameters = OMNI_PARAMETERS.copy()
+    parameters[5:7] = [3.8, 2.9]
+    parameters[-2:] = [0.2, 0.8]
+    calibration = calibration_directory / "camera.yaml"
+    calibration.write_text(
+        f"""
+type: omni
+label: masked-omni
+image_width: 8
+image_height: 6
+intrinsics: {{rows: 24, cols: 1, data: {parameters}}}
+mask: masks/override.png
+""",
+        encoding="utf-8",
+    )
+
+    camera = load_camera_rig(calibration, dtype=DTYPE).cameras[0]
+    assert isinstance(camera, OmniCamera)
+    assert camera.mask is not None
+    assert camera.mask.sum().item() == 1
+    assert not bool(camera.is_masked(torch.tensor([3.8, 2.9], dtype=DTYPE)))
+    # The center is outside the embedded annulus, proving the bitmap replaced it.
+    generated = OmniCamera(8, 6, parameters, dtype=DTYPE)
+    assert bool(generated.is_masked(torch.tensor([3.8, 2.9], dtype=DTYPE)))
+
+
+def test_camera_mask_load_failures_are_clear(tmp_path: Path) -> None:
+    calibration = tmp_path / "camera.yaml"
+
+    def write_calibration(mask_name: str) -> None:
+        calibration.write_text(
+            f"""
+type: pinhole
+image_width: 4
+image_height: 3
+intrinsics: {{rows: 4, cols: 1, data: [2, 2, 2, 1]}}
+distortion: {{type: none, parameters: {{rows: 0, cols: 1, data: []}}}}
+mask: {mask_name}
+""",
+            encoding="utf-8",
+        )
+
+    write_calibration("missing.png")
+    with pytest.raises(FileNotFoundError, match="camera mask file does not exist"):
+        load_camera_rig(calibration)
+
+    unreadable = tmp_path / "unreadable.png"
+    unreadable.write_bytes(b"not an image")
+    write_calibration(unreadable.name)
+    with pytest.raises(ValueError, match="unable to read camera mask file"):
+        load_camera_rig(calibration)
+
+    wrong_size = tmp_path / "wrong-size.png"
+    Image.new("L", (3, 2), 255).save(wrong_size)
+    write_calibration(wrong_size.name)
+    with pytest.raises(ValueError, match="calibration expects 4x3"):
+        load_camera_rig(calibration)
 
 
 def test_camera_rig_exposes_camera_to_body_transforms() -> None:

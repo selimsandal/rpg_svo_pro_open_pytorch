@@ -179,6 +179,7 @@ class Landmark:
     position_world: Tensor
     observations: dict[int, int] = field(default_factory=dict)
     quality: float = 1.0
+    last_structure_optimization: int = 0
 
     def add_observation(self, frame_id: int, feature_index: int) -> None:
         self.observations[frame_id] = feature_index

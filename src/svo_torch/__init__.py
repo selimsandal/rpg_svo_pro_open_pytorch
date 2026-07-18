@@ -9,6 +9,7 @@ from .alignment import PyramidalPatchTracker, SparseImageAligner
 from .camera import Camera, CameraRig, OmniCamera, PinholeCamera, load_camera_rig
 from .config import SVOConfig
 from .depth import DepthSeeds, EpipolarMatcher
+from .depth_filter import SynchronousDepthFilter
 from .features import GridFeatureDetector
 from .frame import FeatureSet, Frame, Landmark, SparseMap
 from .odometry import MonoSVO, OdometryResult, Stage, TrackingQuality, UpdateResult
@@ -31,6 +32,7 @@ __all__ = [
     "SparseImageAligner",
     "SparseMap",
     "Stage",
+    "SynchronousDepthFilter",
     "TrackingQuality",
     "UpdateResult",
     "load_camera_rig",

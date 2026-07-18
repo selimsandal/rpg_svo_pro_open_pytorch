@@ -36,9 +36,10 @@ feature budget. `reprojector_max_keyframes` (including the original
 `reprojector_max_n_kfs` alias) bounds how many recent keyframes are searched.
 
 Inverse-depth seeds retain SVO's `[mu,sigma2,a,b]` Gaussian/uniform plus Beta
-mixture update and its pixel-angle uncertainty model. The implementation is
-synchronous; callers can place independent sequences on separate streams or
-workers without hidden background threads.
+mixture update and its pixel-angle uncertainty model. `MonoSVO` initializes
+seeds on keyframes, uses their estimated points as temporary pose constraints,
+updates the Bayesian state from tracked observations, and promotes observed
+seeds on keyframes.
 
 ## Intentional differences
 
@@ -48,17 +49,23 @@ workers without hidden background threads.
   across distortion models; analytic fused kernels can replace it later.
 - Eight-point essential estimation replaces OpenGV/homography initialization,
   keeping the package free of non-PyTorch vision dependencies.
-- The visual front end triangulates fresh tracks at keyframes. The standalone
-  inverse-depth filter remains available for applications that update seeds at
-  every frame; the epipolar/seed fields in `SVOConfig` retain the corresponding
-  original parameter names but are not an asynchronous `MonoSVO` worker.
+- Seed lifecycle updates are synchronous and use tracked-feature observations.
+  Unlike the original background depth-filter worker, the port does not launch
+  hidden asynchronous epipolar searches; callers can place independent
+  sequences on separate streams or workers when concurrency is wanted.
+- PyTorch honors the documented `structure_optimization_max_pts` bound (20 by
+  default). The released C++ code computes that bounded end iterator but then
+  accidentally loops over the complete deque; reproducing the loop bug is
+  slower and does not preserve the configured behavior.
 - Sparse photometric alignment currently assumes fixed normalized brightness.
   Original illumination gain/offset keys are accepted for configuration-file
   compatibility, but affine brightness estimation is not implemented.
-- Omni annular validity radii embedded in the 24 calibration parameters are
-  enforced. External bitmap paths in a YAML `mask` field are not loaded; apply
-  such a mask to input images before processing when it contains additional
-  irregular invalid regions.
+- Omni annular radii embedded in the 24 calibration parameters generate a
+  feature-detection mask. Canonical external bitmap paths in a YAML `mask`
+  field are loaded relative to that YAML and replace the generated annulus,
+  matching `NCamera::loadFromYaml`. Masks use the OpenCV/SVO convention (zero
+  invalid, nonzero valid) and constrain detection rather than camera projection
+  validity.
 - Relocalization retries the last good local frame; there is no bag-of-words
   place recognition database.
 

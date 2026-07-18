@@ -74,7 +74,7 @@ def _rig_cameras(rig: Any) -> tuple[Any, ...]:
 
 
 def _config_from_args(args: argparse.Namespace) -> SVOConfig:
-    config = SVOConfig.from_yaml(args.config) if args.config else SVOConfig()
+    config = SVOConfig.from_yaml_files(args.config) if args.config else SVOConfig()
     if args.device is not None:
         config.device = args.device
     if args.dtype is not None:
@@ -198,7 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "-c", "--calibration", help="camera rig YAML (recommended over positional form)"
     )
-    run_parser.add_argument("--config", help="optional SVO runtime configuration YAML")
+    run_parser.add_argument(
+        "--config",
+        action="append",
+        help="SVO runtime YAML; repeat to apply camera-specific overrides in order",
+    )
     run_parser.add_argument(
         "--format",
         choices=("auto", "directory", "benchmark", "euroc"),

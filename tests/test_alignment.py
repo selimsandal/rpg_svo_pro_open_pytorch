@@ -77,6 +77,31 @@ def test_sparse_image_aligner_identity_pose() -> None:
     assert torch.allclose(result.T_cur_ref, torch.eye(4), atol=1e-5)
 
 
+def test_sparse_image_aligner_builds_a_bounded_projection_jacobian(monkeypatch) -> None:
+    image = _textured_image(80, 96)
+    pyramid = build_image_pyramid(image, 2)
+    camera = PinholeCamera(96, 80, 80.0, 80.0, 47.5, 39.5)
+    pixels = torch.tensor([[28.0, 25.0], [48.0, 25.0], [68.0, 28.0], [34.0, 55.0], [62.0, 54.0]])
+    depths = torch.full((pixels.shape[0],), 4.0)
+    calls: list[tuple[torch.Size, str | None]] = []
+    original_jacobian = torch.autograd.functional.jacobian
+
+    def recording_jacobian(function, inputs, *args, **kwargs):
+        calls.append((function(inputs).shape, kwargs.get("strategy")))
+        return original_jacobian(function, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(torch.autograd.functional, "jacobian", recording_jacobian)
+    aligner = SparseImageAligner(
+        camera, patch_size=8, max_level=1, min_level=0, max_iterations=1, min_features=3
+    )
+    result = aligner.align(pyramid, pyramid, pixels, depths, torch.eye(4))
+
+    assert result.valid.all()
+    assert calls
+    assert all(shape == (pixels.shape[0], 2) for shape, _ in calls)
+    assert calls[0][1] == "forward-mode"
+
+
 def test_tracker_accepts_uint8_pyramids_and_empty_batches() -> None:
     image = (_textured_image() * 255).to(torch.uint8)
     pyramid = [image[None, None]]

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 
 import torch
 from torch import Tensor
@@ -64,21 +63,17 @@ def _reference_patch_jacobian(
     return reference, jacobian
 
 
-def _pose_patch_residual(
+def _pose_pixel_projection(
     delta: Tensor,
     *,
     transform: Tensor,
     points_ref: Tensor,
     camera: Camera,
-    current_image: Tensor,
-    reference: Tensor,
-    patch_size: int,
 ) -> Tensor:
     candidate = se3_exp(delta) @ transform
     points_cur = transform_points(candidate, points_ref)
     pixels_cur, _ = camera.project(points_cur)
-    current = sample_patches(current_image, pixels_cur, patch_size)
-    return current - reference
+    return pixels_cur
 
 
 class PyramidalPatchTracker:
@@ -299,31 +294,48 @@ class SparseImageAligner:
                 )
                 if int(valid.sum()) < self.min_features:
                     break
-                residual_for_delta = partial(
-                    _pose_patch_residual,
-                    transform=transform,
-                    points_ref=points_ref,
-                    camera=camera_level,
-                    current_image=cur_image,
-                    reference=reference,
-                    patch_size=self.patch_size,
-                )
+
+                def project_with_delta(
+                    delta: Tensor,
+                    base_transform: Tensor = transform,
+                    level_camera: Camera = camera_level,
+                ) -> Tensor:
+                    return _pose_pixel_projection(
+                        delta,
+                        transform=base_transform,
+                        points_ref=points_ref,
+                        camera=level_camera,
+                    )
+
                 zero = torch.zeros(6, dtype=dtype, device=device, requires_grad=True)
-                residual = residual_for_delta(zero)
+                current, image_jacobian = _reference_patch_jacobian(
+                    cur_image, pixels_cur, self.patch_size
+                )
+                residual = (current - reference).detach()
                 try:
-                    jacobian = torch.autograd.functional.jacobian(
-                        residual_for_delta,
+                    projection_jacobian = torch.autograd.functional.jacobian(
+                        project_with_delta,
+                        zero,
+                        create_graph=False,
+                        vectorize=True,
+                        strategy="forward-mode",
+                    )
+                except RuntimeError:
+                    # Some accelerator backends do not implement forward AD
+                    # for every camera-model primitive.  Reverse AD is still
+                    # bounded here because it differentiates only [N, 2]
+                    # projections, never the [N, P, P] sampled image tensor.
+                    projection_jacobian = torch.autograd.functional.jacobian(
+                        project_with_delta,
                         zero,
                         create_graph=False,
                         vectorize=True,
                     )
-                except RuntimeError:
-                    jacobian = torch.autograd.functional.jacobian(
-                        residual_for_delta,
-                        zero,
-                        create_graph=False,
-                        vectorize=False,
-                    )
+                jacobian = torch.einsum(
+                    "npi,niq->npq",
+                    image_jacobian.detach(),
+                    projection_jacobian.detach(),
+                ).reshape(pixels_ref.shape[0], self.patch_size, self.patch_size, 6)
                 flat_valid = valid[:, None, None].expand_as(residual).reshape(-1)
                 r = residual.reshape(-1)[flat_valid]
                 j = jacobian.reshape(-1, 6)[flat_valid]
@@ -346,7 +358,7 @@ class SparseImageAligner:
                 update = update[:, 0]
                 if int(info) != 0 or not bool(torch.isfinite(update).all()):
                     break
-                transform = se3_exp(update) @ transform
+                transform = (se3_exp(update) @ transform).detach()
                 total_iterations += 1
                 if float(torch.linalg.vector_norm(update).detach()) < self.min_update:
                     converged = True

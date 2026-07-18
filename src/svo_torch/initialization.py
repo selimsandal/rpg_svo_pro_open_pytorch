@@ -155,11 +155,32 @@ def estimate_two_view_geometry(
         if inliers.sum() > best_inliers.sum():
             best_inliers = inliers
             best_essential = essential
-            inlier_ratio = float(inliers.float().mean())
-            all_inlier_probability = inlier_ratio**8
-            if 0 < all_inlier_probability < 1:
-                estimated = log(1 - probability) / log(1 - all_inlier_probability)
-                target_iterations = min(target_iterations, max(1, ceil(estimated)))
+            # Only shorten RANSAC when the apparent consensus survives a
+            # non-minimal refit.  A degenerate minimal model can otherwise
+            # claim nearly every bearing as an epipolar inlier and terminate
+            # sampling early, even though refitting those same tracks destroys
+            # the consensus.  The final refit below applies the same guard.
+            stable_count = 0
+            if int(inliers.sum()) >= 8:
+                try:
+                    stability_model = _essential_from_bearings(
+                        bearings_ref[inliers], bearings_cur[inliers]
+                    )
+                    stability_errors = _sampson_error(stability_model, bearings_ref, bearings_cur)
+                    stable_count = int(
+                        (
+                            torch.isfinite(stability_errors)
+                            & (stability_errors <= angular_threshold2)
+                        ).sum()
+                    )
+                except torch.linalg.LinAlgError:
+                    pass
+            if stable_count >= int(inliers.sum()):
+                inlier_ratio = stable_count / count
+                all_inlier_probability = inlier_ratio**8
+                if 0 < all_inlier_probability < 1:
+                    estimated = log(1 - probability) / log(1 - all_inlier_probability)
+                    target_iterations = min(target_iterations, max(1, ceil(estimated)))
         completed = iteration + 1
         if completed >= target_iterations:
             break
@@ -167,9 +188,23 @@ def estimate_two_view_geometry(
     if best_essential is None or int(best_inliers.sum()) < max(8, min_inliers):
         return None
     try:
-        essential = _essential_from_bearings(bearings_ref[best_inliers], bearings_cur[best_inliers])
-        errors = _sampson_error(essential, bearings_ref, bearings_cur)
-        best_inliers = torch.isfinite(errors) & (errors <= angular_threshold2)
+        # A least-squares eight-point refit usually improves a minimal RANSAC
+        # model, but it is not guaranteed to: wide-FOV bearing-vector data can
+        # make the algebraic fit ill-conditioned even when the sampled model
+        # has a strong geometric consensus.  SVO's robust estimator never
+        # replaces its winning model with a worse consensus, so apply the same
+        # guard here instead of unconditionally discarding ``best_essential``.
+        refined = _essential_from_bearings(bearings_ref[best_inliers], bearings_cur[best_inliers])
+        refined_errors = _sampson_error(refined, bearings_ref, bearings_cur)
+        refined_inliers = torch.isfinite(refined_errors) & (refined_errors <= angular_threshold2)
+        if int(refined_inliers.sum()) >= int(best_inliers.sum()):
+            essential = refined
+            errors = refined_errors
+            best_inliers = refined_inliers
+        else:
+            essential = best_essential
+            errors = _sampson_error(essential, bearings_ref, bearings_cur)
+            best_inliers = torch.isfinite(errors) & (errors <= angular_threshold2)
         if int(best_inliers.sum()) < max(8, min_inliers):
             return None
         rotation, translation, points_ref, points_cur = _decompose_and_select_pose(

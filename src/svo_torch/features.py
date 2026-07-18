@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .frame import CORNER, EDGELET, FeatureSet
-from .image import image_gradients, prepare_image, sample_image
+from .image import image_gradients, prepare_image
 
 
 @dataclass(slots=True)
@@ -83,9 +83,22 @@ def _nms(score: Tensor, threshold: Tensor | float) -> Tensor:
 def _mask_at_pixels(mask: Tensor | None, pixels: Tensor) -> Tensor:
     if mask is None:
         return torch.ones(pixels.shape[0], dtype=torch.bool, device=pixels.device)
-    mask_image = prepare_image(mask, device=pixels.device, dtype=pixels.dtype)
-    values = sample_image(mask_image, pixels)
-    return values > 0.5
+    mask_image = torch.as_tensor(mask, device=pixels.device)
+    while mask_image.ndim > 2 and mask_image.shape[0] == 1:
+        mask_image = mask_image[0]
+    if mask_image.ndim != 2:
+        raise ValueError("detector mask must have shape [H,W], [1,H,W], or [1,1,H,W]")
+
+    # SVO's camera mask uses direct ``cv::Mat::at`` lookup after C++ integer
+    # conversion.  Besides matching that behavior, indexing the bitmap once
+    # avoids expanding a full-resolution mask for every feature candidate.
+    height, width = mask_image.shape
+    indices = pixels.to(dtype=torch.long)
+    x, y = indices.unbind(dim=-1)
+    inside = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    x = x.clamp(0, width - 1)
+    y = y.clamp(0, height - 1)
+    return inside & (mask_image[y, x] != 0)
 
 
 def _level_candidates(

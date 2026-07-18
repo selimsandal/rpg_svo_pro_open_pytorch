@@ -16,6 +16,11 @@ dependencies = [
   "torch>=2.4,<3",
 ]
 
+[project.optional-dependencies]
+examples = [
+  "rosbags>=0.11,<0.12",
+]
+
 [project.scripts]
 svo-torch = "svo_torch.cli:main"
 

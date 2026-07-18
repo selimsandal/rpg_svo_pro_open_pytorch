@@ -16,6 +16,7 @@ from typing import Any
 
 import torch
 import yaml
+from PIL import Image
 from torch import Tensor
 
 from .geometry import invert_transform
@@ -87,12 +88,64 @@ class Camera(ABC):
         self.width = int(width)
         self.height = int(height)
         self.label = label
+        self._mask: Tensor | None = None
 
     @property
     def image_size(self) -> tuple[int, int]:
         """Image size as ``(width, height)``."""
 
         return self.width, self.height
+
+    @property
+    def mask(self) -> Tensor | None:
+        """Level-zero detection mask, where zero is invalid and nonzero is valid."""
+
+        return self._mask
+
+    def _set_mask(
+        self,
+        mask: Tensor | None,
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        if mask is None:
+            self._mask = None
+            return
+        tensor = torch.as_tensor(mask, device=device)
+        if tensor.shape != (self.height, self.width):
+            raise ValueError(
+                f"camera mask must have shape ({self.height}, {self.width}), "
+                f"got {tuple(tensor.shape)}"
+            )
+        self._mask = (tensor != 0).to(dtype=torch.uint8).detach()
+
+    def _resized_mask(self, width: int, height: int) -> Tensor | None:
+        if self._mask is None:
+            return None
+        resized = torch.nn.functional.interpolate(
+            self._mask[None, None].to(dtype=torch.float32),
+            size=(height, width),
+            mode="nearest",
+        )
+        return (resized[0, 0] != 0).to(dtype=torch.uint8)
+
+    def is_masked(self, pixels: Tensor) -> Tensor:
+        """Return invalid/masked status using SVO's integer pixel lookup semantics."""
+
+        if pixels.shape[-1:] != (2,):
+            raise ValueError(f"pixels must end in shape (2,), got {tuple(pixels.shape)}")
+        inside = self.is_in_frame(pixels)
+        if self._mask is None:
+            return ~inside
+
+        # C++ ``static_cast<int>`` truncates floating coordinates toward zero.
+        # Clamp out-of-frame indices solely to keep the vectorized lookup safe;
+        # ``inside`` still marks those coordinates as masked.
+        indices = pixels.to(dtype=torch.long)
+        x = indices[..., 0].clamp(0, self.width - 1)
+        y = indices[..., 1].clamp(0, self.height - 1)
+        mask = self._mask.to(device=pixels.device)
+        return ~inside | (mask[y, x] == 0)
 
     @property
     @abstractmethod
@@ -193,6 +246,7 @@ class PinholeCamera(Camera):
         distortion_params: Tensor | Sequence[float] | None = None,
         *,
         label: str = "",
+        mask: Tensor | None = None,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> None:
@@ -217,6 +271,7 @@ class PinholeCamera(Camera):
             )
         if bool(torch.any(self._intrinsics[:2] <= 0.0)):
             raise ValueError("focal lengths must be positive")
+        self._set_mask(mask, device=self.device)
 
     @property
     def intrinsics(self) -> Tensor:
@@ -393,14 +448,17 @@ class PinholeCamera(Camera):
     def scale(self, factor: float) -> PinholeCamera:
         if factor <= 0.0:
             raise ValueError("scale factor must be positive")
+        width = max(1, math.floor(self.width * factor))
+        height = max(1, math.floor(self.height * factor))
         scaled = self._intrinsics * self._intrinsics.new_tensor([factor, factor, factor, factor])
         return PinholeCamera(
-            max(1, math.floor(self.width * factor)),
-            max(1, math.floor(self.height * factor)),
+            width,
+            height,
             *scaled,
             distortion=self.distortion,
             distortion_params=self._distortion_params,
             label=self.label,
+            mask=self._resized_mask(width, height),
         )
 
     def to(self, *args: object, **kwargs: object) -> PinholeCamera:
@@ -416,6 +474,7 @@ class PinholeCamera(Camera):
                 device=intrinsics.device, dtype=intrinsics.dtype
             ),
             label=self.label,
+            mask=None if self._mask is None else self._mask.to(device=intrinsics.device),
         )
 
 
@@ -434,6 +493,7 @@ class OmniCamera(Camera):
         parameters: Tensor | Sequence[float],
         *,
         label: str = "",
+        mask: Tensor | None = None,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> None:
@@ -448,6 +508,9 @@ class OmniCamera(Camera):
         mask_disabled = bool(low == 0.0 and high == 0.0)
         if not mask_disabled and not bool(0.0 <= low < high <= 1.0):
             raise ValueError("omni mask radii must be (0, 0) or satisfy 0 <= low < high <= 1")
+        if mask is None and not mask_disabled:
+            mask = self._annular_mask()
+        self._set_mask(mask, device=self.device)
 
     @property
     def parameters(self) -> Tensor:
@@ -475,13 +538,24 @@ class OmniCamera(Camera):
         one = torch.ones_like(c)
         return torch.stack((one, e, d, c)).reshape(2, 2)
 
-    def _mask_valid(self, pixels: Tensor, parameters: Tensor) -> Tensor:
+    def _annular_mask(self) -> Tensor:
+        if self.width < self.height:
+            raise ValueError("omni annular masks require image width to be at least image height")
+        parameters = self._parameters.detach()
         low, high = parameters[22:24]
-        disabled = (low == 0.0) & (high == 0.0)
-        radius = torch.linalg.vector_norm(pixels - parameters[5:7], dim=-1)
-        reference_radius = 0.5 * self.height
-        inside = (radius >= reference_radius * low) & (radius <= reference_radius * high)
-        return disabled | inside
+        radius = self.height // 2
+        low_squared = (radius * low).square()
+        high_squared = (radius * high).square()
+        center = parameters[5:7].to(dtype=torch.long)
+        y, x = torch.meshgrid(
+            torch.arange(self.height, device=self.device),
+            torch.arange(self.width, device=self.device),
+            indexing="ij",
+        )
+        distance_squared = (x - center[0]).square() + (y - center[1]).square()
+        return ((distance_squared >= low_squared) & (distance_squared <= high_squared)).to(
+            dtype=torch.uint8
+        )
 
     def project(self, points_camera: Tensor) -> tuple[Tensor, Tensor]:
         if points_camera.shape[-1:] != (3,):
@@ -507,7 +581,6 @@ class OmniCamera(Camera):
             & (norm > eps)
             & pole_is_defined
             & self.is_in_frame(pixels)
-            & self._mask_valid(pixels, parameters)
         )
         return pixels, valid
 
@@ -527,6 +600,8 @@ class OmniCamera(Camera):
     def scale(self, factor: float) -> OmniCamera:
         if factor <= 0.0:
             raise ValueError("scale factor must be positive")
+        width = max(1, math.floor(self.width * factor))
+        height = max(1, math.floor(self.height * factor))
         parameters = self._parameters
         powers = torch.arange(5, dtype=parameters.dtype, device=parameters.device)
         polynomial = parameters[:5] * factor ** (1.0 - powers)
@@ -540,17 +615,24 @@ class OmniCamera(Camera):
             )
         )
         return OmniCamera(
-            max(1, math.floor(self.width * factor)),
-            max(1, math.floor(self.height * factor)),
+            width,
+            height,
             scaled,
             label=self.label,
+            mask=self._resized_mask(width, height),
         )
 
     def to(self, *args: object, **kwargs: object) -> OmniCamera:
         parameters = self._parameters.to(*args, **kwargs)
         if not parameters.is_floating_point():
             raise TypeError("camera calibration dtype must be floating point")
-        return OmniCamera(self.width, self.height, parameters, label=self.label)
+        return OmniCamera(
+            self.width,
+            self.height,
+            parameters,
+            label=self.label,
+            mask=None if self._mask is None else self._mask.to(device=parameters.device),
+        )
 
 
 class CameraRig:
@@ -660,9 +742,43 @@ def _yaml_vector(node: Any, name: str) -> list[float]:
     return [float(value) for value in node]
 
 
+def _load_camera_mask(
+    node: Any,
+    *,
+    calibration_directory: Path,
+    width: int,
+    height: int,
+) -> Tensor | None:
+    if node is None:
+        return None
+    if not isinstance(node, str) or not node:
+        raise ValueError("camera mask must be a non-empty file path")
+
+    mask_path = Path(node)
+    if not mask_path.is_absolute():
+        mask_path = calibration_directory / mask_path
+    try:
+        with Image.open(mask_path) as image:
+            image.load()
+            if image.size != (width, height):
+                raise ValueError(
+                    f"camera mask {mask_path} has size {image.width}x{image.height}; "
+                    f"calibration expects {width}x{height}"
+                )
+            grayscale = image.convert("L")
+            buffer = bytearray(grayscale.tobytes())
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"camera mask file does not exist: {mask_path}") from error
+    except OSError as error:
+        raise ValueError(f"unable to read camera mask file {mask_path}: {error}") from error
+
+    return torch.frombuffer(buffer, dtype=torch.uint8).clone().reshape(height, width)
+
+
 def _camera_from_yaml(
     node: Mapping[str, Any],
     *,
+    calibration_directory: Path,
     dtype: torch.dtype,
     device: torch.device | str | None,
 ) -> Camera:
@@ -674,6 +790,12 @@ def _camera_from_yaml(
     except KeyError as error:
         raise ValueError(f"camera entry is missing required key {error.args[0]!r}") from error
     label = str(node.get("label", ""))
+    mask = _load_camera_mask(
+        node.get("mask"),
+        calibration_directory=calibration_directory,
+        width=width,
+        height=height,
+    )
     if camera_type == "pinhole":
         if len(intrinsics) != 4:
             raise ValueError("pinhole intrinsics must contain fx, fy, cx, cy")
@@ -691,6 +813,7 @@ def _camera_from_yaml(
             distortion=distortion,
             distortion_params=distortion_params,
             label=label,
+            mask=mask,
             dtype=dtype,
             device=device,
         )
@@ -700,6 +823,7 @@ def _camera_from_yaml(
             height,
             intrinsics,
             label=label,
+            mask=mask,
             dtype=dtype,
             device=device,
         )
@@ -744,7 +868,8 @@ def load_camera_rig(
     dtype = torch.get_default_dtype() if dtype is None else dtype
     if not dtype.is_floating_point:
         raise TypeError("camera calibration dtype must be floating point")
-    with Path(path).open("r", encoding="utf-8") as stream:
+    calibration_path = Path(path)
+    with calibration_path.open("r", encoding="utf-8") as stream:
         document = yaml.safe_load(stream)
     if not isinstance(document, Mapping):
         raise ValueError(f"camera calibration root must be a mapping: {path}")
@@ -763,10 +888,24 @@ def load_camera_rig(
                 raise ValueError(f"camera rig entry {index} is missing a camera mapping")
             if "T_B_C" not in entry:
                 raise ValueError(f"camera rig entry {index} is missing T_B_C")
-            cameras.append(_camera_from_yaml(camera_node, dtype=dtype, device=device))
+            cameras.append(
+                _camera_from_yaml(
+                    camera_node,
+                    calibration_directory=calibration_path.parent,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
             transforms.append(_transform_from_yaml(entry["T_B_C"], dtype=dtype, device=device))
     else:
-        cameras.append(_camera_from_yaml(document, dtype=dtype, device=device))
+        cameras.append(
+            _camera_from_yaml(
+                document,
+                calibration_directory=calibration_path.parent,
+                dtype=dtype,
+                device=device,
+            )
+        )
         transform_node = document.get(
             "T_B_C", {"data": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}
         )
