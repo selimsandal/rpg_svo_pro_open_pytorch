@@ -1,0 +1,25 @@
+# Tensor-native defaults roughly corresponding to svo_ros/param/pinhole.yaml.
+max_features: 180
+grid_size: 30
+n_pyr_levels: 5
+detector_threshold: 0.01
+quality_min_features: 30
+quality_max_feature_drop: 40
+init_min_features: 80
+init_min_tracked: 50
+init_min_inliers: 40
+init_min_disparity: 20.0
+init_min_parallax: 0.5
+init_map_scale: 1.0
+pose_reprojection_threshold: 2.0
+max_keyframes: 10
+reprojector_max_keyframes: 5
+keyframe_min_disparity: 30.0
+keyframe_min_frames: 2
+patch_size: 8
+alignment_max_level: 4
+alignment_min_level: 1
+alignment_iterations: 10
+seed_convergence_sigma2_thresh: 200.0
+device: auto
+dtype: float32
